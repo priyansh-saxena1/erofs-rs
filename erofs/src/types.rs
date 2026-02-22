@@ -187,8 +187,8 @@ impl Inode {
 
     pub fn file_type(&self) -> FileType {
         match self {
-            Self::Compact((_, n)) => FileType::from_raw_mode(n.mode),
-            Self::Extended((_, n)) => FileType::from_raw_mode(n.mode),
+            Self::Compact((_, n)) => FileType::from_raw_mode(n.mode as _),
+            Self::Extended((_, n)) => FileType::from_raw_mode(n.mode as _),
         }
     }
 
