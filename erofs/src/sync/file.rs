@@ -9,7 +9,9 @@ use crate::Result;
 
 use bytes::Bytes;
 
-use crate::{EroFS, backend::Image, types::Inode};
+use super::EroFS;
+use crate::backend::Image;
+use crate::types::Inode;
 
 #[cfg(not(feature = "std"))]
 /// A trait for reading file contents in `no_std` mode.
@@ -68,18 +70,26 @@ impl<'a, I: Image> Read for File<'a, I> {
 
         if let Some(ref data) = self.buf {
             let offset = self.offset % self.erofs.block_size();
-            let n = cmp::min(buf.len(), data.len().saturating_sub(offset));
+            let data_remaining = data.len().saturating_sub(offset);
+            let n = cmp::min(buf.len(), data_remaining);
             buf[..n].copy_from_slice(&data[offset..offset + n]);
             self.offset += n;
+            if n == data_remaining {
+                self.buf = None;
+            }
             return Ok(n);
         }
 
         let block_size = self.erofs.block_size();
         let cur_offset = self.offset;
-        let block = self
-            .erofs
-            .get_inode_block(&self.inode, cur_offset)
-            .map_err(|e| std::io::Error::other(format!("read block failed: {}", e)))?;
+        let block = self.erofs.get_inode_block(&self.inode, cur_offset);
+
+        #[cfg(feature = "std")]
+        let block =
+            block.map_err(|e| std::io::Error::other(format!("read block failed: {}", e)))?;
+        #[cfg(not(feature = "std"))]
+        let block = block.map_err(|e| e)?;
+
         if buf.len() >= block.len() {
             let n = block.len();
             buf[..n].copy_from_slice(block);
