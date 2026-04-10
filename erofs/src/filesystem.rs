@@ -1,4 +1,5 @@
 use alloc::{format, string::ToString};
+use core::mem::size_of;
 
 use binrw::BinRead;
 use binrw::BinReaderExt;
@@ -87,7 +88,12 @@ impl EroFSCore {
     /// Returns a `BlockPlan` describing what bytes to read.
     /// For `BlockPlan::Chunked`, the caller must perform an additional
     /// read and call `resolve_chunk_read()`.
-    pub(crate) fn plan_inode_block_read(&self, inode: &Inode, offset: usize) -> Result<BlockPlan> {
+    pub(crate) fn plan_inode_block_read(
+        &self,
+        inode: &Inode,
+        offset: usize,
+        xattr_size: usize,
+    ) -> Result<BlockPlan> {
         match inode.layout()? {
             Layout::FlatPlain => {
                 let block_count = inode.data_size().div_ceil(self.block_size);
@@ -112,7 +118,7 @@ impl EroFSCore {
                     // tail block
                     let inode_offset = self.get_inode_offset(inode.id());
                     let buf_size = inode.data_size() % self.block_size;
-                    let offset = inode_offset as usize + inode.size() + inode.xattr_size();
+                    let offset = inode_offset as usize + inode.size() + xattr_size;
                     return Ok(BlockPlan::Direct {
                         offset,
                         size: buf_size,
@@ -151,7 +157,7 @@ impl EroFSCore {
 
                 let inode_offset = self.get_inode_offset(inode.id());
                 let addr_offset =
-                    inode_offset as usize + inode.size() + inode.xattr_size() + (chunk_index * 4);
+                    inode_offset as usize + inode.size() + xattr_size + (chunk_index * 4);
 
                 Ok(BlockPlan::Chunked {
                     addr_offset,
@@ -200,5 +206,47 @@ impl EroFSCore {
 
     pub(crate) fn block_offset(&self, block: u32) -> u64 {
         (block as u64) << self.super_block.blk_size_bits
+    }
+
+    pub(crate) fn xattr_ibody_size_from_slice(
+        data: &[u8],
+        total_count: u16,
+    ) -> Result<usize> {
+        if total_count == 0 {
+            return Ok(0);
+        }
+
+        let header = XattrHeader::read(&mut Cursor::new(data))?;
+        let shared_count = header.shared_count as usize;
+        let total = total_count as usize;
+        if shared_count > total {
+            return Err(Error::CorruptedData(
+                "xattr shared count exceeds total count".to_string(),
+            ));
+        }
+
+        let mut offset = size_of::<XattrHeader>() + shared_count * size_of::<u32>();
+        let inline_count = total - shared_count;
+        for _ in 0..inline_count {
+            if data.len() < offset + size_of::<XattrEntry>() {
+                return Err(Error::CorruptedData(
+                    "xattr entry header out of range".to_string(),
+                ));
+            }
+
+            let entry = XattrEntry::read(&mut Cursor::new(&data[offset..]))?;
+            let entry_size = size_of::<XattrEntry>()
+                + entry.name_len as usize
+                + entry.value_len as usize;
+            let entry_size = entry_size.next_multiple_of(size_of::<XattrEntry>());
+            if data.len() < offset + entry_size {
+                return Err(Error::CorruptedData(
+                    "xattr entry payload out of range".to_string(),
+                ));
+            }
+            offset += entry_size;
+        }
+
+        Ok(offset)
     }
 }

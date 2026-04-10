@@ -1,5 +1,8 @@
 use alloc::format;
+use alloc::string::ToString;
 use alloc::vec::Vec;
+use binrw::{BinRead, io::Cursor};
+use core::mem::size_of;
 use typed_path::Component;
 
 use bytes::Buf;
@@ -83,6 +86,45 @@ impl<I: AsyncImage> EroFS<I> {
         self.core.block_size
     }
 
+    async fn xattr_ibody_size(&self, inode: &Inode) -> Result<usize> {
+        let total_count = inode.xattr_count();
+        if total_count == 0 {
+            return Ok(0);
+        }
+
+        let inode_offset = self.core.get_inode_offset(inode.id()) as usize;
+        let xattr_start = inode_offset + inode.size();
+
+        let mut header_buf = vec![0u8; size_of::<XattrHeader>()];
+        self.image.read_exact_at(&mut header_buf, xattr_start).await?;
+        let header = XattrHeader::read(&mut Cursor::new(&header_buf))?;
+
+        let shared_count = header.shared_count as usize;
+        let total = total_count as usize;
+        if shared_count > total {
+            return Err(Error::CorruptedData(
+                "xattr shared count exceeds total count".to_string(),
+            ));
+        }
+
+        let mut offset = xattr_start + size_of::<XattrHeader>() + shared_count * size_of::<u32>();
+        let inline_count = total - shared_count;
+        for _ in 0..inline_count {
+            let mut entry_buf = vec![0u8; size_of::<XattrEntry>()];
+            self.image.read_exact_at(&mut entry_buf, offset).await?;
+            let entry = XattrEntry::read(&mut Cursor::new(&entry_buf))?;
+            let entry_size = size_of::<XattrEntry>()
+                + entry.name_len as usize
+                + entry.value_len as usize;
+            let entry_size = entry_size.next_multiple_of(size_of::<XattrEntry>());
+            offset = offset
+                .checked_add(entry_size)
+                .ok_or_else(|| Error::CorruptedData("xattr size overflow".to_string()))?;
+        }
+
+        Ok(offset - xattr_start)
+    }
+
     pub async fn get_inode(&self, nid: u64) -> Result<Inode> {
         let offset = self.core.get_inode_offset(nid) as usize;
         let mut buf = vec![0u8; InodeExtended::size()];
@@ -91,7 +133,29 @@ impl<I: AsyncImage> EroFS<I> {
     }
 
     pub(crate) async fn read_inode_block(&self, inode: &Inode, offset: usize) -> Result<Vec<u8>> {
-        match self.core.plan_inode_block_read(inode, offset)? {
+        let layout = inode.layout()?;
+        let xattr_size = if inode.xattr_count() == 0 {
+            0
+        } else {
+            match layout {
+                Layout::FlatInline => {
+                    let block_count = inode.data_size().div_ceil(self.core.block_size);
+                    let block_index = offset / self.core.block_size;
+                    if block_count != 0 && block_index == block_count - 1 {
+                        self.xattr_ibody_size(inode).await?
+                    } else {
+                        0
+                    }
+                }
+                Layout::ChunkBased => self.xattr_ibody_size(inode).await?,
+                _ => 0,
+            }
+        };
+
+        match self
+            .core
+            .plan_inode_block_read(inode, offset, xattr_size)?
+        {
             BlockPlan::Direct { offset, size } => {
                 if size > self.core.block_size {
                     return Err(Error::CorruptedData(format!(

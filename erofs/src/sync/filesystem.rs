@@ -143,6 +143,16 @@ impl<I: Image> EroFS<I> {
         self.core.block_size
     }
 
+    fn xattr_ibody_size(&self, inode: &Inode) -> Result<usize> {
+        let inode_offset = self.core.get_inode_offset(inode.id()) as usize;
+        let xattr_start = inode_offset + inode.size();
+        let data = self
+            .image
+            .get(xattr_start..)
+            .ok_or_else(|| Error::OutOfBounds("failed to read xattr data".to_string()))?;
+        EroFSCore::xattr_ibody_size_from_slice(data, inode.xattr_count())
+    }
+
     pub fn get_inode(&self, nid: u64) -> Result<Inode> {
         let offset = self.core.get_inode_offset(nid) as usize;
         let data = self
@@ -153,7 +163,29 @@ impl<I: Image> EroFS<I> {
     }
 
     pub(crate) fn get_inode_block(&self, inode: &Inode, offset: usize) -> Result<&[u8]> {
-        match self.core.plan_inode_block_read(inode, offset)? {
+        let layout = inode.layout()?;
+        let xattr_size = if inode.xattr_count() == 0 {
+            0
+        } else {
+            match layout {
+                Layout::FlatInline => {
+                    let block_count = inode.data_size().div_ceil(self.core.block_size);
+                    let block_index = offset / self.core.block_size;
+                    if block_count != 0 && block_index == block_count - 1 {
+                        self.xattr_ibody_size(inode)?
+                    } else {
+                        0
+                    }
+                }
+                Layout::ChunkBased => self.xattr_ibody_size(inode)?,
+                _ => 0,
+            }
+        };
+
+        match self
+            .core
+            .plan_inode_block_read(inode, offset, xattr_size)?
+        {
             BlockPlan::Direct { offset, size } => self
                 .image
                 .get(offset..offset + size)
